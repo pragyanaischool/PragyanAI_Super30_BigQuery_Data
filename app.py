@@ -2,72 +2,119 @@ import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
+import plotly.express as px
 
-# 1. Setup Connection
-# In production, use st.secrets for the JSON key
-client = bigquery.Client()
+# 1. AUTHENTICATION & CLIENT SETUP
+def get_bq_client():
+    creds_dict = st.secrets["gcp_service_account"]
+    credentials = service_account.Credentials.from_service_account_info(creds_dict)
+    return bigquery.Client(credentials=credentials, project=creds_dict["project_id"])
 
-st.set_page_config(page_title="PragyanAI Analytics", layout="wide")
-st.title("🎓 Student Performance & Attendance Hub")
+client = get_bq_client()
+PROJECT_ID = st.secrets["gcp_service_account"]["project_id"]
+DATASET_ID = "student_analytics" # Ensure this exists in your GCP Console
 
-# --- DATA UPLOAD TAB ---
-tab1, tab2 = st.tabs(["Upload & Map Data", "Analysis Dashboard"])
+# 2. UI HEADER
+st.set_page_config(page_title="PragyanAI Student Hub", layout="wide")
+st.title("🚀 PragyanAI: Student Performance Engine")
+st.markdown("---")
 
-with tab1:
-    st.subheader("Data Ingestion")
-    category = st.selectbox("Select Table to Update", ["master_students", "attendance", "mcq_results"])
-    uploaded_file = st.file_uploader(f"Upload {category} CSV", type="csv")
+# 3. TABS FOR WORKFLOW
+tab_upload, tab_dashboard = st.tabs(["📤 Data Ingestion", "📊 Analysis Dashboard"])
+
+# --- TAB 1: UPLOAD & MAPPING ---
+with tab_upload:
+    st.header("Upload Student Data")
+    
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        category = st.selectbox(
+            "Select Data Category", 
+            ["master_students", "attendance", "mcq_results"],
+            help="Master: Student names/IDs | Attendance: Daily logs | MCQ: Quiz scores"
+        )
+        uploaded_file = st.file_uploader(f"Upload {category} CSV", type="csv")
 
     if uploaded_file:
         df = pd.read_csv(uploaded_file)
-        st.dataframe(df.head())
         
-        if st.button("Push to BigQuery"):
-            dataset_id = "your_project_id.student_data"
-            table_ref = f"{dataset_id}.{category}"
+        with col2:
+            st.write("### Data Preview")
+            st.dataframe(df.head(5), use_container_width=True)
             
-            # Configuration to append data
-            job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
+            # Map Column Names to Standard if necessary
+            st.info("Ensure your CSV has 'student_id' for mapping.")
+        
+        if st.button("🚀 Push to BigQuery"):
+            table_ref = f"{PROJECT_ID}.{DATASET_ID}.{category}"
+            
+            job_config = bigquery.LoadJobConfig(
+                write_disposition="WRITE_APPEND", # Adds new data to existing
+                autodetect=True,
+            )
             
             try:
-                client.load_table_from_dataframe(df, table_ref, job_config=job_config).result()
-                st.success(f"Successfully updated {category}!")
+                with st.spinner("Writing to BigQuery..."):
+                    job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+                    job.result()
+                st.success(f"Successfully updated {category} table!")
+                st.balloons()
             except Exception as e:
                 st.error(f"Error: {e}")
 
-# --- ANALYSIS TAB ---
-with tab2:
-    st.subheader("Integrated Performance Analytics")
+# --- TAB 2: ANALYSIS & MAPPING ---
+with tab_dashboard:
+    st.header("Unified Performance Tracking")
     
-    # Query to join tables on student_id
-    sql_query = """
+    # This SQL joins the three tables on student_id
+    # It calculates Attendance % and Average MCQ scores per student
+    query = f"""
     SELECT 
+        m.student_id,
         m.full_name,
         m.department,
-        COUNT(a.status) as total_sessions,
-        SUM(CASE WHEN a.status = 'Present' THEN 1 ELSE 0 END) as attended_sessions,
-        AVG(q.score) as avg_mcq_score
-    FROM `your_project_id.student_data.master_students` m
-    LEFT JOIN `your_project_id.student_data.attendance` a ON m.student_id = a.student_id
-    LEFT JOIN `your_project_id.student_data.mcq_results` q ON m.student_id = q.student_id
-    GROUP BY 1, 2
+        COUNT(a.status) as total_days,
+        COUNTIF(a.status = 'Present') as days_present,
+        AVG(q.score) as avg_score
+    FROM `{PROJECT_ID}.{DATASET_ID}.master_students` m
+    LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.attendance` a ON m.student_id = a.student_id
+    LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.mcq_results` q ON m.student_id = q.student_id
+    GROUP BY 1, 2, 3
     """
     
-    if st.button("Generate Insights"):
-        results_df = client.query(sql_query).to_dataframe()
-        
-        # Calculate Attendance %
-        results_df['attendance_rate'] = (results_df['attended_sessions'] / results_df['total_sessions']) * 100
-        
-        # Display Metrics
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Top Performer", results_df.iloc[results_df['avg_mcq_score'].idxmax()]['full_name'])
-        col2.metric("Avg Attendance", f"{results_df['attendance_rate'].mean():.1f}%")
-        col3.metric("Batch Strength", len(results_df))
-        
-        st.divider()
-        st.write("### Detailed Student Breakdown")
-        st.dataframe(results_df.style.background_gradient(subset=['avg_mcq_score'], cmap='Greens'))
-        
-        # Performance Chart
-        st.bar_chart(data=results_df, x="full_name", y="avg_mcq_score")
+    if st.button("🔄 Refresh Analysis"):
+        try:
+            results = client.query(query).to_dataframe()
+            
+            # Post-processing
+            results['attendance_pct'] = (results['days_present'] / results['total_days']).fillna(0) * 100
+            
+            # KPI Metrics
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Batch Avg Score", f"{results['avg_score'].mean():.1f}%")
+            m2.metric("Avg Attendance", f"{results['attendance_pct'].mean():.1f}%")
+            m3.metric("Total Students", len(results))
+            
+            st.markdown("### Student Performance List")
+            st.dataframe(
+                results[['full_name', 'department', 'attendance_pct', 'avg_score']]
+                .sort_values(by='avg_score', ascending=False),
+                use_container_width=True
+            )
+            
+            # Visual: Correlation between Attendance and Performance
+            st.markdown("### Attendance vs. MCQ Performance")
+            fig = px.scatter(
+                results, 
+                x="attendance_pct", 
+                y="avg_score", 
+                color="department",
+                hover_name="full_name",
+                size="days_present",
+                title="Correlation Analysis"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+        except Exception as e:
+            st.warning("Ensure all 3 tables exist in BigQuery and contain 'student_id'.")
+            st.error(f"Query Error: {e}")
